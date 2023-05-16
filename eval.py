@@ -17,6 +17,7 @@ from datasets import DatasetDict, Dataset, load_from_disk, load_metric
 from typing import Optional, Dict, List
 from loguru import logger
 
+
 import argparse
 
 format_time = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
@@ -29,88 +30,102 @@ def setup_seed(seed: int):
     random.seed(seed)
 
 
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset', type=str, default="glue")
-    parser.add_argument('--task_name', type=str, default=None)
-    parser.add_argument('--model_name', type=str, default="t5-base")
-    parser.add_argument('--device', type=str, default="cuda:0")
-    parser.add_argument('--seed', type=int, default=42)
+# piqa eval
+def eval_answer(output_filepath, eval_filepath, dev_textpath, dataset_name: str = 'piqa'):
+    with open(output_filepath, encoding="utf-8") as output_file:
+        outputs_json = output_file.read()
+    with open(eval_filepath, encoding="utf-8") as eval_file:
+        standard = eval_file.read().splitlines()
+    with open(dev_textpath, encoding="utf-8") as dev_text:
+        text = dev_text.read().splitlines()
+    
+    if dataset_name == 'piqa':
+        output_dict = json.loads(outputs_json)
+        for idx, _dict in enumerate(output_dict):
+            output = _dict['answer']
+            if output == '0' or output == '1':
+                continue
+            elif ("sol1" in output) or ("sol 1" in output) or ("Option 1" in output):
+                output == '0'
+            elif ("sol2" in output) or ("sol 2" in output) or ("Option 2" in output):
+                output == '1'
+            else:
+                data = json.loads(text[idx])
+                sol1 = data["sol1"]
+                sol2 = data["sol2"]
+                if (data["sol1"][:64] in output) or (output in sol1):
+                    output == '0'
+                elif (data["sol2"][:64] in output) or (output in sol2):
+                    output == '1'
+                else:
+                    output == '0'
+    elif dataset_name == 'hellaswag':
+        for idx, output in enumerate(outputs):
+            if len(output) == 1:
+                continue
+            elif output == "0":
+                output == '0'
+            elif output == "1":
+                output == '1'
+            elif output == "2":
+                output == '2'
+            elif output == "3":
+                output == '3'
+            else:
+                data = json.loads(text[idx])
+                sol1 = data["activity_label"] + data["ending_options"][0]
+                sol2 = data["activity_label"] + data["ending_options"][1]
+                sol3 = data["activity_label"] + data["ending_options"][2]
+                sol4 = data["activity_label"] + data["ending_options"][3]
+                if (data["ending_options"][0] in output) or (output in sol1):
+                    output == '0'
+                elif (data["ending_options"][1] in output) or (output in sol2):
+                    output == '1'
+                elif (data["ending_options"][2] in output) or (output in sol3):
+                    output == '2'
+                elif (data["ending_options"][3] in output) or (output in sol3):
+                    output == '3'
+                else:
+                    output == '0'
+    elif dataset_name == 'winogrande':
+        for idx, output in enumerate(outputs):
+            if output == '2' or output == '1':
+                continue
+            elif "option1" in output:
+                output == '1'
+            elif "option2" in output:
+                output == '2'
+            else:
+                data = json.loads(text[idx])
+                if data["option1"] in output:
+                    output == '1'
+                elif data["option2"][:64] in output:
+                    output == '2'
+                else:
+                    output == '1'
+    # print(standard[:10],outputs)
+    print("the rating in the {} is {}".format(dataset_name, accuracy_score(standard, outputs)))
 
-    # for train
-    parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--weight_decay', type=float, default=0)
-    parser.add_argument('--adam_epsilon', type=float, default=1e-8)
-    parser.add_argument('--num_warump_steps', type=int, default=0)
-    parser.add_argument('--batch_size', type=int, default=16)
-    parser.add_argument('--num_epochs', type=int, default=2)
-    parser.add_argument('--max_grad_norm', type=float, default=1.0)
-    parser.add_argument('--shuffle', action='store_true')
-
-    return parser.parse_args()
-
-
-def run():
-    args = parse_args()
-    assert args.dataset == "glue"
-
-    setup_seed(args.seed)
-    try:
-        raw_datasets = load_from_disk(
-            '../../.cache/datasets/{}/{}'.format(args.dataset, args.task_name))
-    except:
-        logger.error('dataset: [{}] does not exist'.format(args.dataset))
-        raise
-    assert isinstance(raw_datasets, DatasetDict)
-
-    tokenizer = T5Tokenizer.from_pretrained(
-        args.model_name, cache_dir=f"../../.cache/models")
-    config = T5Config.from_pretrained(
-        args.model_name, cache_dir=f"../../.cache/models")
-    model = T5ForConditionalGeneration(config)
-
-    checkpoint_path = "../../.cache/checkpoint/{}-{}-{}.pth".format(
-        args.dataset, args.task_name, args.model_name)
-    state_dict: Dict[str, torch.Tensor] = torch.load(
-        checkpoint_path, map_location='cpu')
-    model.load_state_dict(state_dict)
-
-    glue_utils = GlueUtils()
-    preprocess_function = glue_utils.init_glue_preprocess_function(
-        args, tokenizer)
-
-    for key in list(raw_datasets.keys()):
-        if key.startswith("test"):
-            del raw_datasets[key]
-
-    raw_datasets = raw_datasets.map(
-        preprocess_function,
-        batched=True,
-        desc="Running tokenizer on dataset",
-    )
-    for key, dataset in raw_datasets.items():
-        raw_datasets[key] = dataset.remove_columns(
-            set(dataset.column_names) - set(glue_utils.columns))
-
-    datasets: Dict[str, Dataset] = {
-        'train': raw_datasets['train'],
-        'validation': raw_datasets["validation_matched" if args.task_name == "mnli" else "validation"]
-    }
-
-    data_collator = DataCollatorForSeq2Seq(tokenizer)
-
-    # metric = evaluate.load(args.dataset, args.task_name)
-    metric = load_metric("metric/" + args.dataset + ".py", args.task_name)
-    trainer = T5GlueTrainer(args, model, datasets,
-                            tokenizer, data_collator, metric)
-
-    validation_resutls = trainer.evaluate(
-        "validation",
-        datasets["validation"]
-    )
-    for metric, rest in validation_resutls.items():
-        logger.info("teacher-[validation] {:<6}: {:.5}".format(metric, rest))
-
+if __name__=='__main__':
+    
+    
+    output_filepath = 'answer.jsonl'
+    eval_filepath = './metric/piqa/label/valid-labels.lst'
+    dev_textpath = './metric/piqa/inputs/valid.jsonl'
+    dataset_name = "piqa"
+    
+    # output_filepath = 'answer.txt'
+    # eval_filepath = './metric/hellaswag-train-dev/valid-labels.lst'
+    # dev_textpath = './metric/hellaswag-train-dev/valid.jsonl'
+    # dataset_name = "hellaswag"
+    
+    # output_filepath = 'answer.txt'
+    # eval_filepath = './metric/winogrande_1.1/dev-labels.lst'
+    # dev_textpath = './metric/winogrande_1.1/dev.jsonl'
+    # dataset_name = "winogrande"
+    
+    eval_answer(output_filepath, eval_filepath, dev_textpath, dataset_name)
+    
 
 if __name__ == '__main__':
     run()
